@@ -1,0 +1,5 @@
+numpy
+statsmodels
+ISLP
+scikit-learn
+seaborn
