@@ -1,0 +1,1155 @@
+```{r echo=FALSE}
+knitr::opts_chunk$set(fig.retina = 2.5, fig.align = "center",
+                      fig.width = 6, fig.height = 3,
+                      cache.path = "cache/")
+```
+
+# Resampling Methods
+
+>Resampling methods are an indispensable tool in modern statistics. They
+involve repeatedly drawing samples from a training set and refitting a model
+of interest on each sample in order to obtain additional information about
+the fitted model. For example, in order to estimate the variability of a linear
+regression fit, we can repeatedly draw different samples from the training
+data, fit a linear regression to each new sample, and then examine the
+extent to which the resulting fits differ. Such an approach may allow us to
+obtain information that would not be available from fitting the model only
+once using the original training sample.
+
+>In this chapter, we discuss two of the most commonly
+used resampling methods, *cross-validation* and the *bootstrap*.
+
+Cross-validation is most often used to estimate test error associated with a statistical learning method, whereas the boostrap is most commonly used to provide a measure of accuracy for a given parameter/method.
+
+> The process
+of evaluating a model’s performance is known as *model assessment*, whereas 
+the process of selecting the proper level of flexibility for a model is known as *model selection*.
+
+## Cross Validation
+
+Sometimes we want to estimate the test error rate using the available training data.
+A number of approaches can be used for this.
+In this section we consider methods which involve *holding out* a subset of the training data from the fitting process, then applying the model to that hold-out set for model assessment.
+
+### The Validation Set Approach {#validation-set}
+
+This simple strategy involves randomly dividing available observations into training and validation sets.
+The model is fit on the training set, and used to make predictions on the validation set.
+The corresponding metric from the validation set predictions -- usually MSE in the case of a quantitative response -- provides an estimate of the test error rate.
+
+To illustrate this, load the `Auto` data set and R packages:
+
+```{r message=FALSE}
+auto <- ISLR2::Auto
+
+library(tidyverse)
+library(tidymodels)
+library(broom)
+library(gt)
+library(patchwork)
+library(tictoc)
+
+# Load my R package and set the ggplot theme
+library(dunnr)
+extrafont::loadfonts(device = "win", quiet = TRUE)
+theme_set(theme_td())
+set_geom_fonts()
+set_palette()
+```
+
+Randomly split the data into 50% training and 50% validation, fit on the training set, and compute the MSE on the validation set.
+Since I'll be repeating this 10 times to reproduce the figure, make a couple functions.
+First, a function to set a random seed and split the data into training and validation set (called `assessment` set in the `rsample` package):
+
+```{r}
+auto_validation_split <- function(seed) {
+  set.seed(seed)
+  validation_split(auto, prop = 0.5)
+}
+auto_splits <- auto_validation_split(seed = 10)
+auto_splits
+```
+
+Similar to the `initial_split` workflow, I can access the training and validation sets as follows:
+
+```{r}
+training(auto_splits$splits[[1]]) %>% head()
+assessment(auto_splits$splits[[1]]) %>% head()
+```
+
+Second, a function to fit 10 models (1 to 10 polynomial degrees of freedom) on the training set, and evaluate on the validation set with `fit_resamples()`:
+^[In the text, they compute the MSE but here I am computing RMSE then squaring it. This is because `yardstick` has a `rmse()` function but not an `mse()` function. If I wanted to, I could define a custom metric [like this](https://yardstick.tidymodels.org/articles/custom-metrics.html).]
+
+```{r}
+auto_rec <- recipe(mpg ~ horsepower, data = auto)
+lm_workflow <- workflow() %>% add_model(linear_reg())
+
+evaluate_poly_fits <- function(auto_splits) {
+  tibble(poly_df = 1:10) %>%
+    mutate(
+      lm_rec = map(
+        poly_df, ~ auto_rec %>% step_poly(horsepower, degree = .x)
+      ),
+      lm_fit = map(
+        lm_rec,
+        ~ lm_workflow %>% add_recipe(.x) %>% fit_resamples(auto_splits)
+      ),
+      lm_metrics = map(lm_fit, collect_metrics)
+    ) %>%
+    unnest(lm_metrics) %>%
+    filter(.metric == "rmse") %>%
+    select(poly_df, rmse = mean)
+}
+auto_poly_fits_validation <- evaluate_poly_fits(auto_splits)
+auto_poly_fits_validation
+```
+
+Run it an additional 9 times:
+
+```{r auto_poly_fits_validation_10}
+auto_poly_fits_validation_10 <- bind_rows(
+  # 9 additional sets of fits
+  map_dfr(
+    1:9,
+    function(seed) {
+      auto_splits <- auto_validation_split(seed)
+      evaluate_poly_fits(auto_splits)
+    },
+    .id = "rep"
+  ),
+  auto_poly_fits_validation %>% mutate(rep = "10")
+)
+```
+
+Now reproduce Figure 5.2:
+
+```{r figure5.2}
+# Use a 10 color palette from the MetBrewer package
+pal <- MetBrewer::met.brewer("Veronese", 10, type = "continuous")
+
+p2 <- auto_poly_fits_validation_10 %>%
+  ggplot(aes(x = poly_df, y = rmse^2, fill = rep)) +
+  geom_line(aes(color = rep), size = 1) +
+  expand_limits(y = c(15, 30)) +
+  scale_x_continuous(breaks = seq(2, 10, 2)) +
+  scale_color_manual(values = pal) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Degree of polynomial", y = NULL) +
+  theme(legend.position = "none")
+p1 <- p2 %+% filter(auto_poly_fits_validation_10, rep == "1") +
+  geom_point(aes(fill = rep), shape = 21,  color = "white", size = 4) +
+  labs(y = "MSE")
+p1 | p2
+```
+
+As is clear from the right-hand panel, this approach is highly variable depending on the testing/validation set split.
+Another downside is that, because the training set used to fit the data has fewer observations, it tends to overestimate the test error rate on the entire data set.
+
+### Leave-One-Out Cross Validation {#loocv}
+
+*Leave-one-out cross validation* (LOOCV) attempts to address the shortcomings of the validation set approach.
+It still involves splitting the $n$ observations into two parts, but it repeats it $n$ times, with a single observation $(x_i, y_i)$ as the hold-out "set" and the remaining $n-1$ observations as the training set.
+The MSE for each iteration is simply $\text{MSE}_i = (y_i - \hat{y}_i)^2$.
+Then the LOOCV estimate of the MSE is the average over all observations:
+
+$$
+\text{CV}_{(n)} = \frac{1}{n} \sum_{i=1}^n \text{MSE}_i.
+$$
+
+The LOOCV approach has a few advantages over the validation set approach:
+
+>
+* First, it has far less bias. In LOOCV, we repeatedly fit the statistical learning method using training sets that contain $n − 1$ observations, almost as many as are in the entire data set. This is in contrast to the validation set approach, in which the training set is typically around half the size of the original data set. Consequently, the LOOCV approach tends not to overestimate the test error rate as much as the validation set approach does.
+* Second, in contrast to the validation approach which will yield different results when applied repeatedly due to randomness in the training/validation set splits, performing LOOCV multiple times will always yield the same results: there is no randomness in the training/validation set splits.
+
+Define a new function to split the data by LOOCV:
+^[Since there is no random splitting with this approach, I don't need use a function that sets the random seed.]
+
+```{r}
+auto_splits <- loo_cv(auto)
+auto_splits
+```
+
+`r nrow(auto_splits)` splits, which is the number of observations, as expected.
+Fit:
+
+```{r error=TRUE}
+auto_poly_fits_loo_cv <- evaluate_poly_fits(auto_splits)
+```
+
+As the error says, LOOCV is not supported.
+Here's an [explanation I found online](https://www.tmwr.org/resampling.html#leave-one-out-cross-validation):
+
+>
+Leave-one-out methods are deficient compared to almost any other method. For anything but pathologically small samples, LOO is computationally excessive and it may not have good statistical properties. Although rsample contains a `loo_cv()` function, these objects are not generally integrated into the broader tidymodels frameworks.
+
+Fair enough.
+For completeness, I will still get the LOOCV estimates using `boot::cv.glm()`:
+
+```{r}
+auto_poly_fits_loo_cv <- tibble(
+  poly_df = 1:10,
+  mse = map_dbl(poly_df,
+    function(poly_df) {
+      glm_fit <- glm(mpg ~ poly(horsepower, degree = poly_df), data = auto)
+      boot::cv.glm(auto, glm_fit)$delta[1]
+    }
+  )
+)
+auto_poly_fits_loo_cv
+```
+
+### $k$-fold Cross-Validation {#kfoldcv}
+
+*$k$-fold CV* involves randomly dividing the observations into $k$ groups/folds of approximately equal size.
+The first fold is used as the validation/assessment set, and the remaining $k-1$ folds used to fit the model.
+This is repeated $k$ times, with each fold being used as the assessment set once.
+The $k$-fold CV estimate of the test error is then the average:
+
+$$
+\text{CV}_{(k)} = \frac{1}{k} \sum_{i=1}^k \text{MSE}_i.
+$$
+
+This should look familiar:
+
+>
+It is not hard to see that LOOCV is a special case of $k$-fold CV in which $k$
+is set to equal $n$. In practice, one typically performs $k$-fold CV using $k$ = 5
+or $k$ = 10. What is the advantage of using $k$ = 5 or $k$ = 10 rather than
+$k$ = $n$? The most obvious advantage is computational. LOOCV requires
+fitting the statistical learning method $n$ times. This has the potential to be
+computationally expensive (except for linear models fit by least squares,
+in which case formula (5.2) can be used). But cross-validation is a very
+general approach that can be applied to almost any statistical learning
+method. Some statistical learning methods have computationally intensive
+fitting procedures, and so performing LOOCV may pose computational
+problems, especially if $n$ is extremely large. In contrast, performing 10-fold
+CV requires fitting the learning procedure only ten times, which may be
+much more feasible. As we see in Section 5.1.4, there also can be other
+non-computational advantages to performing 5-fold or 10-fold CV, which
+involve the bias-variance trade-off.
+
+Fit the polynomial models with 10-fold CV:
+
+```{r}
+auto_10_fold_cv <- function(seed) {
+  set.seed(seed)
+  vfold_cv(auto, v = 10)
+}
+auto_splits <- auto_10_fold_cv(seed = 10)
+auto_splits
+```
+
+```{r}
+auto_poly_fits_10_fold_cv <- evaluate_poly_fits(auto_splits)
+auto_poly_fits_10_fold_cv
+```
+
+Now repeat this another 9 times.
+Thought it won't take *too* long to run, I'll make use of `parallel` to speed it up a bit:
+
+```{r message=FALSE}
+n_cores <- parallel::detectCores(logical = FALSE)
+library(doParallel)
+cl <- makePSOCKcluster(n_cores - 1)
+registerDoParallel(cl)
+```
+
+
+```{r auto_poly_fits_10_fold_cv, cache=TRUE}
+tic()
+auto_poly_fits_10_fold_cv <- bind_rows(
+  # 9 additional sets of fits
+  map_dfr(
+    1:9,
+    function(seed) {
+      auto_splits <- auto_10_fold_cv(seed)
+      evaluate_poly_fits(auto_splits)
+    },
+    .id = "rep"
+  ),
+  auto_poly_fits_10_fold_cv %>% mutate(rep = "10")
+)
+toc()
+```
+
+Now reproduce Figure 5.4:
+
+```{r figure5.4}
+p2 <- auto_poly_fits_10_fold_cv %>%
+  mutate(mse = rmse^2) %>%
+  ggplot(aes(x = poly_df, y = mse, fill = rep)) +
+  geom_line(aes(color = rep), size = 1) +
+  expand_limits(y = c(15, 30)) +
+  scale_x_continuous(breaks = seq(2, 10, 2)) +
+  scale_color_manual(values = pal) +
+  scale_fill_manual(values = pal) +
+  labs(x = "Degree of polynomial", y = NULL) +
+  theme(legend.position = "none")
+p1 <- p2 %+% mutate(auto_poly_fits_loo_cv, rep = "1") +
+  geom_point(aes(fill = rep), shape = 21,  color = "white", size = 4) +
+  labs(y = "MSE")
+p1 | p2
+```
+
+The $k$-fold CV approach (right panel) still has some variability due to random splitting, but much less than the validation set approach.
+
+As a reminder, with cross-validation we are trying to approximate the true test MSE, which we cannot know for certain unless the data are simulated (like in Figure 5.6).
+The true error value itself is important if we want to know how a model will perform on independent data.
+However, if all we care about is parameter(s) that give the minimum error (like the degree of polynomial in these examples), then the CV estimate will usually come close to the true answer.
+
+### Bias-Variance Trade-Off for $k$-Fold Cross-Validation
+
+In addition to being computationally more efficient than LOOCV, $k$-fold CV with $k < n$ also often gives more accurate estimates of the test error rate due to the bias-variance tradeoff.
+
+* $k$-fold CV has moderate bias in comparison to LOOCV, which is approximately unbiased.
+* $k$-fold CV (average over $k$ fitted models) tends to have lower variance than LOOCV (average over $n$ fitted models, highly correlated with each other).
+
+>To summarize, there is a bias-variance trade-off associated with the
+choice of $k$ in $k$-fold cross-validation. Typically, given these considerations,
+one performs $k$-fold cross-validation using $k$ = 5 or $k$ = 10, as these values
+have been shown empirically to yield test error rate estimates that suffer
+neither from excessively high bias nor from very high variance.
+
+### Cross-Validation on Classification Problems
+
+Rather than quantitative $Y$, cross-validation works just as well with qualitative $Y$.
+Instead of MSE, we use the number of misclassified observations, $\text{Err}_i = I(y_i \neq \hat{y}_i)$.
+The LOOCV error rate:
+
+$$
+\text{CV}_{(n)} = \frac{1}{n} \sum_{i=1}^n \text{Err}_i.
+$$
+
+The $k$-fold CV and validation set error rates are defined analogously.
+
+## The Bootstrap {#bootstrap-lab}
+
+>
+The *bootstrap* is a widely applicable and extremely powerful statistical tool that can be used to quantify the uncertainty associated with a given estimator or statistical learning method. As a simple example, the bootstrap can be used to estimate the standard errors of the coefficients from a linear regression fit. In the specific case of linear regression, this is not particularly useful, since we saw in Chapter 3 that standard statistical software such as R outputs such standard errors automatically. However, the power of the bootstrap lies in the fact that it can be easily applied to a wide range of statistical learning methods, including some for which a measure of variability is otherwise difficult to obtain and is not automatically output by
+statistical software.
+
+The toy example in this section is about investment in two assets $X$ and $Y$.
+We wish to choose a fraction $\alpha$ of investment into $X$ which minimizes the total variance (risk) of the investment.
+In can be shown that the optimal value is given by:
+
+$$
+\alpha = \frac{\sigma_Y^2 - \sigma_{XY}}{\sigma_X^2 + \sigma_Y^2 - 2\sigma_{XY}},
+$$
+
+where $\sigma_X^2 = \text{Var}(X)$, $\sigma_Y^2 = \text{Var}(Y)$, and $\sigma_{XY} = \text{Cov}(X, Y)$.
+In reality, we don't know these variances and covariance, so we estimate them (e.g. $\hat{\sigma}_X^2$) using observations of $X$ and $Y$ to get an estimated $\hat{\alpha}$.
+
+To illustrate, we simulate 100 pairs of $X$ and $Y$, and compute the estimated $\alpha$.
+The simulation parameters are $\sigma_X^2 = 1$, $\sigma_Y^2 = 1.25$, and $\sigma_{XY} = 0.5$.
+Presumably, these are bivariate normally distributed, which I can simulate with the `mvtnorm` package:
+
+```{r}
+library(mvtnorm)
+sigma_x <- 1
+sigma_y <- sqrt(1.25)
+sigma_xy <- 0.5
+# The variance-covariance matrix
+sigma <- matrix(c(sigma_x^2, sigma_xy, sigma_xy, sigma_y^2), nrow = 2)
+# Generate 5 observations
+rmvnorm(n = 5, mean = c(0, 0), sigma = sigma)
+```
+
+Write a function to compute $\alpha$ from the simulated $X$ and $Y$:
+
+```{r}
+sim_alpha <- function(xy = NULL) {
+  if (is.null(xy)) {
+    xy <- rmvnorm(n = 100, mean = c(0, 0), sigma = sigma)
+  }
+  x <- xy[,1]; y <- xy[,2]
+  (var(y) -  cov(x, y)) / (var(x) + var(y) - 2 * cov(x, y))
+}
+sim_alpha()
+```
+
+Run four simulations and plot $X$ vs $Y$ for Figure 5.9
+
+```{r figure5.9}
+set.seed(319)
+d4 <- tibble(sim = 1:4) %>%
+  rowwise() %>%
+  mutate(xy = list(rmvnorm(n = 100, mean = c(0, 0), sigma = sigma))) %>%
+  ungroup() %>%
+  mutate(alpha = map_dbl(xy, sim_alpha) %>% round(3),
+         x = map(xy, ~ .x[,1]), y = map(xy, ~ .x[,2])) %>%
+  unnest(cols = c(x, y))
+d4 %>%
+  ggplot(aes(x, y)) +
+  geom_point(color = td_colors$nice$emerald, size = 2) +
+  facet_wrap(~alpha, labeller = "label_both") +
+  add_facet_borders()
+```
+
+For Figure 5.10, I first simulate 1000 data sets from the true population and estimate $\alpha$ for each:
+
+```{r}
+d <- bind_rows(
+  d4 %>% distinct(sim, alpha),
+  tibble(sim = 5:1000) %>%
+    rowwise() %>%
+    mutate(alpha = sim_alpha()) %>%
+    ungroup()
+)
+d
+```
+
+And then, using just the first simulated data set, use the `rsample::boostraps()` function to generate 1000 bootstrap resamples:
+
+```{r}
+d1_boot <- d4 %>% filter(sim == 1) %>% select(x, y) %>%
+  rsample::bootstraps(times = 1000)
+d1_boot
+```
+
+Compute $\hat{\alpha}$ from each split:
+
+```{r}
+d1_boot_alpha <- map_dbl(
+  d1_boot$splits,
+  function(split) {
+    xy <- as.data.frame(split)
+    sim_alpha(as.matrix(xy))
+  }
+)
+```
+
+Now reproduce the figure:
+
+```{r figure5.10, fig.width=7, fig.height=3}
+d <- bind_rows(
+  d %>% mutate(population = "true"),
+  tibble(alpha = d1_boot_alpha, population = "bootstrap resamples")
+) %>%
+  mutate(population = fct_rev(population))
+
+true_alpha <- (sigma_y^2 - sigma_xy) / (sigma_x^2 + sigma_y^2 - 2 * sigma_xy)
+p1 <- d %>%
+  ggplot(aes(x = alpha, fill = population)) +
+  geom_histogram(binwidth = 0.05, show.legend = FALSE, color = "black") +
+  geom_vline(xintercept = true_alpha,
+             color = td_colors$nice$light_coral, size = 1.5) +
+  facet_wrap(~ population, nrow = 1) +
+  scale_fill_manual(values = c(td_colors$nice$soft_orange,
+                               td_colors$nice$strong_blue))
+p2 <- d %>%
+  ggplot(aes(y = alpha, x = population)) +
+  geom_boxplot(aes(fill = population), show.legend = FALSE) +
+  geom_hline(yintercept = true_alpha,
+             color = td_colors$nice$light_coral, size = 1.5) +
+  scale_fill_manual(values = c(td_colors$nice$soft_orange,
+                               td_colors$nice$strong_blue))
+p1 | p2
+```
+
+>
+Note that the histogram looks very similar to the left-hand panel, which
+displays the idealized histogram of the estimates of α obtained by generating 1,000 simulated data sets from the true population. In particular the
+bootstrap estimate $\text{SE}(\hat{\alpha})$ from (5.8) is 0.087, very close to the estimate
+of 0.083 obtained using 1,000 simulated data sets. The right-hand panel
+displays the information in the center and left panels in a different way, via
+boxplots of the estimates for $\alpha$ obtained by generating 1,000 simulated data
+sets from the true population and using the bootstrap approach. Again, the
+boxplots have similar spreads, indicating that the bootstrap approach can
+be used to effectively estimate the variability associated with $\hat{\alpha}$.
+
+## Lab: Cross-Validation and the Bootstrap
+
+### The Validation Set Approach
+
+Here are the MSE values as computed in \@ref(validation-set):
+
+```{r}
+auto_poly_fits_validation_10 %>%
+  filter(poly_df <= 3, rep == 1) %>%
+  mutate(mse = rmse^2)
+```
+
+### Leave-One-Out Cross-Validation
+
+Because LOOCV is deterministic (not random), the process in \@ref(loocv) produces the same MSE values:
+
+```{r}
+auto_poly_fits_loo_cv
+```
+
+### $k$-fold Cross-Validation
+
+The MSE values as computed in \@ref(kfoldcv):
+
+```{r}
+auto_poly_fits_10_fold_cv %>%
+  filter(rep == 1) %>%
+  mutate(mse = rmse^2)
+```
+
+### The Bootstrap {#bootstrap}
+
+#### Estimating the Accuracy of a Statistic of Interest {-}
+
+```{r}
+portfolio <- ISLR2::Portfolio
+glimpse(portfolio)
+```
+
+The `tidymodels` approach to bootstrap estimates, as in \@ref(bootstrap-lab):
+
+```{r}
+portfolio_boot <- bootstraps(portfolio, times = 1000)
+portfolio_boot_alpha <- map_dbl(
+  portfolio_boot$splits,
+  function(split) {
+    xy <- as.data.frame(split)
+    (var(xy$Y) - cov(xy$X, xy$Y)) /
+      (var(xy$X) + var(xy$Y) - 2 * cov(xy$X, xy$Y))
+  }
+)
+mean(portfolio_boot_alpha); sd(portfolio_boot_alpha)
+```
+
+#### Estimating the Accuracy of a Regression Model {-}
+
+>
+The bootstrap approach can be used to assess the variability of the coefficient estimates and predictions from a statistical learning method. Here we use the bootstrap approach in order to assess the variability of the estimates for $\beta_0$ and $\beta_1$, the intercept and slope terms for the linear regression model that uses horsepower to predict mpg in the `Auto` data set. We will compare the estimates obtained using the bootstrap to those obtained using the formulas for $\text{SE}(\hat{\beta}_0)$ and $\text{SE}(\hat{\beta}_1)$ described in Section 3.1.2.
+
+```{r}
+auto_boot <- bootstraps(auto, times = 1000)
+```
+
+By default, the `tune::fit_resamples()` function does not keep the model object from each fit.
+Usually, all we care about is the performance metrics and (if we're tuning) the best hyper parameters.
+So in order to get the actual regression coefficients, I need to provide a `control_grid()` object to the `control` argument of `fit_resamples()` (see [this article for more explanation]( https://www.tidymodels.org/learn/models/coefficients)):
+
+```{r}
+get_lm_coefs <- function(x) {
+  x %>% extract_fit_engine() %>% broom::tidy()
+}
+tidy_ctrl <- control_grid(extract = get_lm_coefs)
+```
+
+Now fit the resamples with this with control object:
+
+```{r auto_boot_fit, cache=TRUE}
+tic()
+auto_boot_fit <- workflow() %>%
+  add_model(linear_reg()) %>%
+  add_recipe(recipe(mpg ~ horsepower, data = auto)) %>%
+  fit_resamples(auto_boot, control = tidy_ctrl)
+toc()
+auto_boot_fit %>% head()
+```
+
+The `.extracts` column contains the tidy model objects.
+It is a bit clunky to work with -- it is a list column with a list of tibbles, so requires `tidyr::unnest()` twice:
+
+```{r}
+# A single `.extracts` element, which contains a tibble
+auto_boot_fit$.extracts[[1]]
+# Using `unnest` to get all `.extracts`
+auto_boot_fit_coefs <- auto_boot_fit %>%
+  unnest(.extracts) %>%
+  unnest(.extracts) %>%
+  select(id, term, estimate, std.error)
+auto_boot_fit_coefs %>% head()
+```
+
+Then taking the mean of the estimates, and applying equation 5.8 to get the standard error:
+
+```{r}
+auto_boot_fit_coefs %>%
+  group_by(term) %>%
+  summarise(
+    mean_estimate = mean(estimate),
+    se_estimate = sd(estimate),
+    .groups = "drop"
+  ) %>%
+  gt() %>%
+  fmt_number(columns = -term, decimals = 4)
+```
+
+Not exactly the same as those in the text due to the difference in the random bootstrap samples.
+And here are the SE estimates using the formula from section 3.1.2:
+
+```{r}
+tidy(lm(mpg ~ horsepower, data = auto)) %>%
+  select(term, estimate, se_estimate = std.error) %>%
+  gt() %>%
+  fmt_number(columns = -term, decimals = 4)
+```
+
+These estimates are similar, but wouldn't be considered close.
+
+>
+Does this indicate a problem with the bootstrap? In fact, it suggests the opposite. Recall that the standard formulas given in Equation 3.8 on page 66 rely on certain assumptions. For example, they depend on the unknown parameter $\sigma^2$, the noise variance. We then estimate $\sigma^2$ using the RSS. Now although the formulas for the standard errors do not rely on the linear model being correct, the estimate for $\sigma^2$ does. We see in
+Figure 3.8 on page 91 that there is a non-linear relationship in the data, and so the residuals from a linear fit will be inflated, and so will $\hat{\sigma}^2$. Secondly, the standard formulas assume (somewhat unrealistically) that the $x_i$ are fixed, and all the variability comes from the variation in the errors $\epsilon_i$. The bootstrap approach does not rely on any of these assumptions, and so it is likely giving a more accurate estimate of the standard errors of $\hat{\beta}_0$ and $\hat{\beta}_1$ than is the `summary()` function.
+
+We can find better correspondence between bootstrap and regression estimates if we use the quadratic model because it better fits the data:
+
+```{r auto_boot_quad_fit, cache=TRUE}
+tic()
+auto_boot_quad_fit <- workflow() %>%
+  add_model(linear_reg()) %>%
+  add_recipe(
+    recipe(mpg ~ horsepower, data = auto) %>%
+      # Need to set `raw` = TRUE to not use orthogonal polynomials
+      step_poly(horsepower, degree = 2, options = list(raw = TRUE))
+  ) %>%
+  fit_resamples(auto_boot, control = tidy_ctrl)
+toc()
+```
+```{r}
+auto_boot_quad_fit %>%
+  unnest(.extracts) %>%
+  unnest(.extracts) %>%
+  group_by(term) %>%
+  summarise(
+    mean_estimate = mean(estimate),
+    se_estimate = sd(estimate),
+    .groups = "drop"
+  ) %>%
+  gt() %>%
+  fmt_number(columns = -term, decimals = 4)
+```
+
+```{r}
+# Need to set `raw` = TRUE to not use orthogonal polynomials
+tidy(lm(mpg ~ poly(horsepower, 2, raw = TRUE), data = auto)) %>%
+  select(term, estimate, se_estimate = std.error) %>%
+  gt() %>%
+  fmt_number(columns = -term, decimals = 4)
+```
+
+## Exercises
+
+### Applied {-}
+
+#### 5. Logistic regression with `default` - validation set {-}
+
+```{r}
+default <- ISLR2::Default
+```
+
+(a) Fit a logistic regression model that uses `income` and `balance` to predict `default`.
+
+```{r}
+default_workflow <- workflow() %>%
+  add_model(logistic_reg(mode = "classification", engine = "glm"))
+default_rec <- recipe(default ~ income + balance, data = default)
+
+default_fit <- default_workflow %>%
+  add_recipe(default_rec) %>%
+  fit(data = default)
+extract_fit_parsnip(default_fit)
+```
+
+(b) Using the validation set approach, estimate the test error of this model.
+
+Set seed and split:
+
+```{r}
+set.seed(940)
+default_splits <- validation_split(default, prop = 0.5)
+```
+
+Fit and evaluate the model with the hold out:
+
+```{r}
+default_fit_validation <- default_workflow %>%
+  add_recipe(default_rec) %>%
+  fit_resamples(default_splits)
+collect_metrics(default_fit_validation)
+```
+
+The accuracy of the model is
+`r scales::percent(collect_metrics(default_fit_validation)$mean[[1]], accuracy = 0.01)`
+and so the test error is
+`r scales::percent(1 - collect_metrics(default_fit_validation)$mean[[1]], accuracy = 0.01)`.
+
+The `tidymodels` workflow made fitting and assessing this model very easy -- just 5 lines of code.
+For comparison purposes, here is how you could do it without `tidymodels` (excluding the data splitting part):
+
+```{r}
+default_train <- training(default_splits$splits[[1]])
+default_assess <- assessment(default_splits$splits[[1]])
+
+default_glm <- glm(default ~ income + balance, data = default_train,
+                   family = "binomial")
+augment(default_glm, newdata = default_assess, type.predict = "response") %>%
+  mutate(default_pred = ifelse(.fitted > 0.5, "Yes", "No")) %>%
+  summarise(error_rate = mean(default != default_pred)) %>%
+  .$error_rate %>% scales::percent(accuracy = 0.01)
+```
+
+(c) Repeat the process in (b) three times, using three different splits of the observations. Comment on the results.
+
+```{r}
+set.seed(109)
+bind_rows(
+  collect_metrics(default_fit_validation) %>% mutate(rep = 1),
+  map_dfr(2:4,
+    function(rep) {
+      default_workflow %>%
+        add_recipe(default_rec) %>%
+        fit_resamples(validation_split(default, prop = 0.5)) %>%
+        collect_metrics() %>%
+        mutate(rep = rep)
+    }
+  )
+) %>%
+  filter(.metric == "accuracy") %>%
+  transmute(
+    rep,
+    accuracy = scales::percent(mean, accuracy = 0.01),
+    test_error = scales::percent(1 - mean, accuracy = 0.01)
+  ) %>%
+  gt()
+```
+
+The estimates are actually quite stable.
+
+(d) Add the dummy variable `student` to the logistic regression model. Comment on whether or not this leads to a reduction in the test error rate.
+
+```{r}
+default_rec_student <-
+  recipe(default ~ income + balance + student, data = default) %>%
+  step_dummy(student)
+
+default_fit_validation_student <- default_workflow %>%
+  add_recipe(default_rec_student) %>%
+  fit_resamples(default_splits)
+collect_metrics(default_fit_validation_student)
+```
+
+Adding the `student` variable resulted in a test error rate of
+`r scales::percent(1 - collect_metrics(default_fit_validation_student)$mean[1], accuracy = 0.01)`
+and so did not lead to a reduction compared to the original model.
+
+#### 6. Logistic regression with `default` - standard error estimation {-}
+
+(a) Determine the estimated standard errors for the coefficients using `summary()` and `glm()`.
+
+Here it is in base R:
+
+```{r}
+glm(default ~ income + balance, data = default, family = "binomial") %>%
+  summary()
+```
+
+In `tidymodels`, I can use the `extract_fit_engine()` function to get the same:
+
+```{r}
+logistic_reg() %>%
+  fit(default ~ income + balance, data = default) %>%
+  extract_fit_engine() %>%
+  summary()
+```
+
+(b) Write a function that takes as input the `default` data set as well as the index of the observations, and that outputs the coefficient estimates for `income` and `balance` in the multiple logistic regression model.
+
+Instead of the workflow I used in \@ref(bootstrap-lab) (with `fit_resamples()`), I'll show a different way.
+First, a function that takes a `split` object (a bootstrap sample), fits the model and returns the tidy regression coefficients:
+
+```{r}
+get_tidy_default_fit <- function(split) {
+  logistic_reg() %>%
+    fit(default ~ income + balance, data = as.data.frame(split)) %>%
+    broom::tidy()
+}
+```
+
+(c) Get the bootstrap estimates for the standard errors.
+
+Now I use `purrr::map()` to fit the models using the function from (b):
+
+```{r}
+default_boot <- bootstraps(default, times = 100)
+```
+
+```{r default_fits, cache=TRUE}
+tic()
+default_fits <- map_dfr(
+  default_boot$splits, get_tidy_default_fit,
+  .id = "split"
+)
+toc()
+```
+
+Then estimate the standard errors of the coefficients:
+
+```{r}
+default_fits %>%
+  group_by(term) %>%
+  summarise(mean_estimate = mean(estimate), se_estimate = sd(estimate)) %>%
+  gt() %>%
+  fmt_number(columns = -term, n_sigfig = 3)
+```
+
+(d) Comment on the estimated standard errors obtained using the `glm()` function and using your bootstrap function.
+
+```{r}
+glm(default ~ income + balance, data = default, family = "binomial") %>%
+  broom::tidy() %>%
+  select(term, estimate, se_estimate = std.error) %>%
+  gt() %>%
+  fmt_number(columns = -term, n_sigfig = 3)
+```
+
+The estimates are essentially the same between the two methods.
+
+#### 7. LOOCV with `weekly` {-}
+
+```{r}
+weekly <- ISLR2::Weekly
+```
+
+(a) Fit a logistic regression model that predicts `Direction` using `Lag1` and `Lag2`.
+
+```{r}
+direction_fit <- logistic_reg() %>%
+  fit(Direction ~ Lag1 + Lag2, data = weekly)
+tidy(direction_fit)
+```
+
+(b) Fit the same model using all but the first observation.
+
+A shortcut to getting all but the first row of a data frame is `tail(df, -1)`:
+
+```{r}
+direction_fit_1 <- logistic_reg() %>%
+  fit(Direction ~ Lag1 + Lag2, data = tail(weekly, -1))
+tidy(direction_fit_1)
+```
+
+(c) Use the model from (b) to predict the direction of the first observation. Was this observation correctly classified?
+
+```{r}
+augment(direction_fit_1, new_data = head(weekly, 1)) %>%
+  select(Lag1, Lag2, Direction, .pred_class, .pred_Down, .pred_Up)
+```
+
+It was predicted as "Up", which is incorrect.
+
+(d) Write a for loop from $i = 1$ to $i = n$, where $n$ is the number of observations in the data set, that fits a model using all but the $i$th observation to prediction `Direction`. Then use that fit to predict the `Direction` of the held out observation.
+
+Instead of a for loop, I'll use `purrr`:
+
+```{r direction_loocv_preds, cache=TRUE}
+tic()
+direction_loocv_preds <-
+  map_dfr(
+    1:nrow(weekly),
+    ~logistic_reg() %>%
+      # Fit with `slice` to exclude the single row (`-.x`)
+      fit(Direction ~ Lag1 + Lag2, data = slice(weekly, -.x)) %>%
+      # Predict with `slice` to get just that row (`.x`)
+      augment(new_data = slice(weekly, .x)) %>%
+      select(Lag1, Lag2, Direction, starts_with(".pred")),
+    .id = "i"
+  )
+toc()
+```
+
+When running long computations in an iterative way (with a for loop or mapping with `purrr`), it is very easy to take advantage of parallel computing with `future` and `furrr`:
+
+```{r direction_loocv_preds_future, cache=TRUE}
+library(future)
+# Use all but one of my cores
+plan(multisession(workers = availableCores() - 1))
+
+tic()
+direction_loocv_preds <-
+  furrr::future_map_dfr(
+    1:nrow(weekly),
+    ~logistic_reg() %>%
+      fit(Direction ~ Lag1 + Lag2, data = slice(weekly, -.x)) %>%
+      augment(new_data = slice(weekly, .x)) %>%
+      select(Lag1, Lag2, Direction, starts_with(".pred")),
+    .id = "i"
+  )
+toc()
+```
+
+(e) Take the average of the $n$ numbers obtained in (d) in order to obtain the LOOCV estimate for the test error. Comment on the results.
+
+I can compute the error, as well as some other metrics, manually like this:
+
+```{r}
+direction_loocv_preds %>%
+  summarise(
+    n_correct = sum(Direction == .pred_class),
+    accuracy = n_correct / n(),
+    error_rate = 1 - accuracy,
+    # Defining "Up" as positive, compute sensitivity and specificity
+    sensitivity = sum(Direction == "Up" & .pred_class == "Up") /
+      sum(Direction == "Up"),
+    specificity = sum(Direction == "Down" & .pred_class == "Down") /
+      sum(Direction == "Down"),
+    across(c(accuracy, error_rate, sensitivity, specificity), scales::percent)
+  ) %>%
+  gt()
+```
+
+The `yardstick` package has a helpful `metrics()` function for quickly computing various metrics:
+
+```{r}
+metrics(direction_loocv_preds, truth = Direction, estimate = .pred_class)
+```
+
+For classification, this returns by default the accuracy and the Kappa statistic.
+The latter is a metric that compares the observed accuracy with a random chance classifier.
+It may be familiar in the context of inter-rater reliability, which is an important aspect of test/scale/measurement validity.
+Kappa values range from 0 to 1, with high values indicating better agreement.
+The threshold for an acceptable value will vary by context, but the value here
+(`r round(kap(direction_loocv_preds, truth = Direction, estimate = .pred_class)$.estimate, 4)`)
+is undoubtedly poor.
+
+I can define a custom `metric_set()` to get my desired classification metrics for this model:
+^[The list of available metrics in `yardstick` can be found in [this article](https://yardstick.tidymodels.org/articles/metric-types.html#metrics-1).]
+
+```{r}
+classification_metrics <- metric_set(accuracy, sensitivity, specificity)
+classification_metrics(direction_loocv_preds,
+                       truth = Direction, estimate = .pred_class) %>%
+  pivot_wider(names_from = .metric, values_from = .estimate) %>%
+  transmute(
+    error_rate = 1 - accuracy,
+    across(c(accuracy, error_rate, sensitivity, specificity), scales::percent)
+  ) %>%
+  gt()
+```
+
+Note that the labels are switched from my manual calculation: sensitivity is swapped for specificity.
+This is because the "positive" level (called the `event_level` in `yardstick`) was manually chosen as "Up" by me, but automatically chosen as "Down" by `yardstick`.
+I can switch this by changing the `event_level` argument in the `sensitivity()` and `specificity()` functions:
+
+```{r}
+sensitivity(direction_loocv_preds, truth = Direction, estimate = .pred_class,
+            event_level = "second")
+```
+
+But ideally this is something I would set before fitting the model -- by setting "Up" as the first level of the `Direction` factor, `tidymodels` will interpret it as the "event" or "positive" level.
+
+#### 8. Cross-validation on simulated data {-}
+
+(a) Generate a simulated data set. What is $n$ and $p$? Write out the model used to generate the data in equation form.
+
+```{r}
+set.seed(1)
+x <- rnorm(100)
+y <- x - 2 * x^2 + rnorm(100)
+```
+
+The number of observations is $n$ = 100, and the number of predictors is $p$ = 1.
+
+$$
+\begin{align}
+Y &= \beta_0 + \beta_1 X + \beta_2 X^2 + \epsilon \\
+X &\sim \text{Normal}(0, 1) \\
+\epsilon &\sim \text{Normal}(0, 1) \\
+\beta_0 &= 0 \\
+\beta_1 &= 1 \\
+\beta_2 &= -2
+\end{align}
+$$
+
+(b) Create a scatterplot of $X$ against $Y$.
+
+```{r fig.height=3, fig.width=4}
+d <- tibble(x, y)
+ggplot(d, aes(x, y)) +
+  geom_point()
+```
+
+This is obviously a very non-linear relationship, with a negative parabola shape.
+A model without a polynomial term of $X$ will definitely be a poor fit.
+
+(c) Set a random seed, and then compute the LOOCV errors that result from fitting the following four models using least squares:
+
+$$
+\begin{align}
+Y &= \beta_0 + \beta_1 X + \epsilon \\
+Y &= \beta_0 + \beta_1 X + \beta_2 X^2 + \epsilon \\
+Y &= \beta_0 + \beta_1 X + \beta_2 X^2 + \beta_3 X^3 + \epsilon \\
+Y &= \beta_0 + \beta_1 X + \beta_2 X^2 + \beta_3 X^3 + \beta_4 X^4 + \epsilon
+\end{align}
+$$
+
+```{r sim_fits_c, cache=TRUE}
+set.seed(927)
+tic()
+sim_fits_c <- crossing(i = 1:nrow(d), poly_df = 1:4) %>%
+  mutate(
+    fit = furrr::future_map2(
+      i, poly_df,
+      ~ linear_reg() %>%
+        fit(y ~ poly(x, degree = .y), data = slice(d, -.x))
+    ),
+    resid_i = furrr::future_map2_dbl(
+      i, fit,
+      ~ augment(.y, new_data = slice(d, .x)) %>% pull(.resid)
+    )
+  )
+toc()
+```
+
+```{r}
+sim_fits_c %>%
+  group_by(poly_df) %>%
+  summarise(mse = sum(resid_i^2)) %>%
+  gt() %>%
+  fmt_number(mse, decimals = 2)
+```
+
+(d) Repeat (c) using another random seed. Are your results the same? Why?
+
+```{r sim_fits_d, cache=TRUE}
+set.seed(213)
+sim_fits_d <- crossing(i = 1:nrow(d), poly_df = 1:4) %>%
+  mutate(
+    fit = furrr::future_map2(
+      i, poly_df,
+      ~ linear_reg() %>%
+        fit(y ~ poly(x, degree = .y), data = slice(d, -.x))
+    ),
+    resid_i = furrr::future_map2_dbl(
+      i, fit,
+      ~ augment(.y, new_data = slice(d, .x)) %>% pull(.resid)
+    )
+  )
+```
+
+```{r}
+sim_fits_d %>%
+  group_by(poly_df) %>%
+  summarise(mse = sum(resid_i^2)) %>%
+  gt() %>%
+  fmt_number(mse, decimals = 2)
+```
+
+Despite setting different random seeds, the results are exactly the same because none of the above code involved the generation of random numbers.
+LOOCV is an entirely deterministic process -- each observation is used a single time as the holdout/evaluation data set.
+
+(e) Which of the models had the smallest LOOCV error?
+
+The lowest MSE was the second model ($Y = \beta_0 + \beta_1 X + \beta_2 X^2 + \epsilon$) which is unsurprising because this is also the model used to generate the data.
+
+(f) Comment on the statistical significance of the coefficient estimates that result from fitting each of the models in (c) using least squares. Do these results agree with the conclusions drawn based on the cross-validation results?
+
+```{r}
+sim_fits_c %>%
+  # For this, use the model fits that excluded the first (i = 1) observation
+  filter(i == 1) %>%
+  mutate(fit_tidy = map(fit, tidy)) %>%
+  unnest(fit_tidy) %>%
+  transmute(
+    poly_df = paste0("polynomial degree = ", poly_df),
+    term = factor(term,
+                  labels = c("beta_0", "beta_1", "beta_1",
+                             "beta_2", "beta_3", "beta_4")),
+    estimate = round(estimate, 2), std.error = round(std.error, 2),
+    p.value = scales::pvalue(p.value)
+  ) %>%
+  group_by(poly_df) %>%
+  gt()
+```
+
+This is aligned with the cross-validation results: the model with the 2nd degree polynomial ($\beta_1$ and $\beta_2$) has statistically significant coefficients.
+The 3rd and 4th degree terms ($\beta_3$ and $\beta_4$) are not significant in either model.
+
+#### 9. Bootstrap with `boston` {-}
+
+```{r}
+boston <- ISLR2::Boston
+```
+
+(a) Provide an estimate for the population mean of `medv`. Call this estimate $\hat{\mu}$.
+
+```{r}
+mean(boston$medv)
+```
+
+(b) Provide an estimate for the standard error of $\hat{\mu}$.
+
+```{r}
+sd(boston$medv) / sqrt(nrow(boston))
+```
+
+(c) Now estimate the standard error of $\hat{\mu}$ using the bootstrap. How does this compare to your answer from (b)?
+
+```{r}
+set.seed(214)
+boston_boot <- bootstraps(boston, times = 1000)
+boston_boot_mu <- map_dbl(
+  boston_boot$splits, ~ mean(as.data.frame(.x)$medv)
+)
+mean_mu <- mean(boston_boot_mu)
+se_mu <- sd(boston_boot_mu)
+mean_mu; se_mu
+```
+
+For comparison, here is the implementation with the `boot` package:
+
+```{r}
+set.seed(214)
+medv_mean <- function(data, i) mean(data$medv[i])
+boot::boot(boston, statistic = medv_mean, R = 1000)
+```
+
+The results are slightly different, even with the same seed, because the inner workings of the functions use random numbers in different ways, but both are very close to the estimate from (b).
+
+(d) Based on your bootstrap estimate from (c), provide a 95 % confidence interval for the mean of `medv`. Compare it to the results obtained using `t.test(boston$medv)`.
+
+Approximate interval using the bootstrap estimates:
+
+```{r}
+mean_mu - 2 * se_mu; mean_mu + 2 * se_mu
+```
+
+```{r}
+t.test(boston$medv)
+```
+
+The 95% confidence intervals are essentially equal.
+
+(e) Provide an estimate, $\hat{\mu}_{\text{med}}$, for the median value of `medv` in the population.
+
+```{r}
+median(boston$medv)
+```
+
+(f) We now would like to estimate the standard error of $\hat{\mu}_{\text{med}}$. Unfortunately, there is no simple formula for computing the standard error of the median. Instead, estimate the standard error of the
+median using the bootstrap.
+
+```{r}
+set.seed(25)
+boston_boot_median <- map_dbl(
+  boston_boot$splits, ~ median(as.data.frame(.x)$medv)
+)
+mean_median <- mean(boston_boot_median)
+se_median <- sd(boston_boot_median)
+mean_median; se_median
+```
+
+(g) Provide an estimate, $\hat{\mu}_{0.1}$, for the tenth percentile of `medv`.
+
+```{r}
+quantile(boston$medv, probs = 0.1)
+```
+
+(h) Use the bootstrap to estimate the standard error of $\hat{\mu}_{0.1}$.
+
+```{r}
+set.seed(6929)
+boston_boot_p10 <- map_dbl(
+  boston_boot$splits, ~ quantile(as.data.frame(.x)$medv, probs = 0.1)
+)
+mean_p10 <- mean(boston_boot_p10)
+se_p10 <- sd(boston_boot_p10)
+mean_p10; se_p10
+```
+
