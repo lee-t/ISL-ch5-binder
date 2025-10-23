@@ -3,3 +3,4 @@ statsmodels
 ISLP
 scikit-learn
 seaborn
+pandas
